@@ -1,0 +1,717 @@
+import React, { useState, useMemo } from 'react';
+import { Upload, FileText, AlertCircle, CheckCircle, Clock, Search, X, Printer, Filter, Sparkles, Mail, ListChecks, MessageSquare, Copy, Loader } from 'lucide-react';
+
+// --- Utility Functions ---
+
+// Simple CSV Parser that handles quoted fields
+const parseCSV = (text) => {
+  const rows = [];
+  let currentRow = [];
+  let currentField = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const nextChar = text[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && nextChar === '"') {
+        currentField += '"'; // Handle escaped quotes
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      currentRow.push(currentField.trim());
+      currentField = '';
+    } else if ((char === '\r' || char === '\n') && !inQuotes) {
+      if (currentField || currentRow.length > 0) {
+        currentRow.push(currentField.trim());
+        rows.push(currentRow);
+      }
+      currentRow = [];
+      currentField = '';
+      if (char === '\r' && nextChar === '\n') i++;
+    } else {
+      currentField += char;
+    }
+  }
+  if (currentField || currentRow.length > 0) {
+    currentRow.push(currentField.trim());
+    rows.push(currentRow);
+  }
+  return rows;
+};
+
+// Flexible date parser
+const parseDate = (dateStr) => {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  return isNaN(d.getTime()) ? null : d;
+};
+
+// Calculate days difference
+const getDaysDiff = (date1, date2) => {
+  const oneDay = 24 * 60 * 60 * 1000;
+  return Math.round(Math.abs((date1 - date2) / oneDay));
+};
+
+// Location Normalizer
+const normalizeLocation = (rawLoc) => {
+  if (!rawLoc) return 'Unknown Location';
+  const cleanLoc = rawLoc.trim();
+  
+  // Mapping logic based on prefixes
+  if (cleanLoc.startsWith('Cooper')) return 'Cooper';
+  if (cleanLoc.startsWith('Bader')) return 'Bader';
+  if (cleanLoc.startsWith('Croft')) return 'Crofton';
+  if (cleanLoc.startsWith('Escal')) return 'Escalante';
+  if (cleanLoc.startsWith('West')) return 'West';
+  if (cleanLoc.startsWith('Snyder')) return 'Snyder';
+  if (cleanLoc.startsWith('Mear')) return 'Mears Apartments';
+  if (cleanLoc.startsWith('Cent')) return 'Centennial Apartments';
+  if (cleanLoc.startsWith('Anim')) return 'Animas';
+  
+  return cleanLoc; // Return original if no match
+};
+
+// --- API Helper ---
+const callGemini = async (prompt) => {
+  const apiKey = ""; // Runtime provided
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+  
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }]
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    
+    const data = await response.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated.";
+  } catch (error) {
+    console.error("Gemini API Error:", error);
+    return "Error connecting to AI service. Please try again.";
+  }
+};
+
+export default function WorkOrderApp() {
+  const [data, setData] = useState([]);
+  const [fileName, setFileName] = useState(null);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [activeTab, setActiveTab] = useState('open'); // open, recent, 120, 60, 30
+  const [locationFilter, setLocationFilter] = useState('All');
+
+  // AI Modal State
+  const [modalOpen, setModalOpen] = useState(false);
+  const [selectedRow, setSelectedRow] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiResponse, setAiResponse] = useState("");
+  const [aiAction, setAiAction] = useState(null);
+
+  // --- File Handling ---
+  const handleFileUpload = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    // Reset states
+    setFileName(file.name);
+    setErrorMsg(null);
+    setData([]);
+    setLocationFilter('All');
+
+    const reader = new FileReader();
+
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        const parsedRows = parseCSV(text);
+        
+        if (parsedRows.length < 2) {
+          setErrorMsg("The file appears to be empty or missing headers.");
+          return;
+        }
+
+        // Normalize Headers to Lowercase for easier matching
+        const headers = parsedRows[0].map(h => h.toLowerCase().trim());
+        
+        // Map columns with strict checks to avoid "Request" matching "Request Date"
+        const idxMap = {
+          wo: headers.findIndex(h => h.includes('work order') || h.includes('wo #')),
+          reqDate: headers.findIndex(h => h.includes('request date')),
+          closeDate: headers.findIndex(h => h.includes('closed date')),
+          
+          // Strict check for 'request': Must include 'request' but NOT 'date' or 'requestor'
+          request: headers.findIndex(h => h === 'request' || (h.includes('request') && !h.includes('date') && !h.includes('requestor') && !h.includes('requester'))),
+          
+          requester: headers.findIndex(h => h.includes('requestor') || h.includes('requester')),
+          location: headers.findIndex(h => h.includes('location')),
+          genComment: headers.findIndex(h => h.includes('general comment')),
+          taskComment: headers.findIndex(h => h.includes('task comment')),
+          tech: headers.findIndex(h => h.includes('technician')),
+          trade: headers.findIndex(h => h.includes('trade'))
+        };
+
+        // Validation: Check if critical 'Work Order' column exists
+        if (idxMap.wo === -1) {
+          setErrorMsg("Could not find a 'Work Order #' column. Please check your CSV headers.");
+          return;
+        }
+
+        const processedData = parsedRows.slice(1).map(row => {
+          // Guard against empty rows
+          if (!row[idxMap.wo]) return null;
+
+          const reqDate = parseDate(row[idxMap.reqDate]);
+          const closeDate = parseDate(row[idxMap.closeDate]);
+          const now = new Date();
+
+          // Filter: If closed and older than 30 days, ignore it
+          if (closeDate) {
+            const daysSinceClose = getDaysDiff(now, closeDate);
+            if (daysSinceClose > 30) return null;
+          }
+          
+          const isOpen = !closeDate; 
+          const age = reqDate ? getDaysDiff(now, reqDate) : 0;
+          
+          const daysSinceClose = closeDate ? getDaysDiff(now, closeDate) : 9999;
+          const isRecent = !!closeDate && daysSinceClose <= 14;
+
+          return {
+            wo: row[idxMap.wo],
+            reqDate: row[idxMap.reqDate],
+            closeDate: row[idxMap.closeDate],
+            reqDateObj: reqDate,
+            request: row[idxMap.request] || "No description provided",
+            requester: row[idxMap.requester],
+            location: normalizeLocation(row[idxMap.location]),
+            comments: `${row[idxMap.genComment] || ''} ${row[idxMap.taskComment] || ''}`.trim(),
+            tech: row[idxMap.tech],
+            trade: row[idxMap.trade] || 'Unassigned',
+            isOpen,
+            age,
+            isRecent
+          };
+        }).filter(item => item !== null); 
+
+        if (processedData.length === 0) {
+          setErrorMsg("No valid work orders found in the file.");
+        } else {
+          setData(processedData);
+        }
+
+      } catch (err) {
+        console.error(err);
+        setErrorMsg("Error processing file. Please ensure it is a valid CSV.");
+      }
+    };
+
+    reader.readAsText(file);
+  };
+
+  // --- Aggregations ---
+  const stats = useMemo(() => {
+    const s = {
+      openTotal: 0,
+      openByTrade: {},
+      recentTotal: 0,
+      recentByTrade: {},
+      age120: 0,
+      age60: 0,
+      age30: 0
+    };
+
+    data.forEach(item => {
+      // Open Calculations
+      if (item.isOpen) {
+        s.openTotal++;
+        s.openByTrade[item.trade] = (s.openByTrade[item.trade] || 0) + 1;
+
+        // Aging
+        if (item.age >= 120) s.age120++;
+        else if (item.age >= 60) s.age60++;
+        else if (item.age >= 30) s.age30++;
+      }
+
+      // Recent Calculations
+      if (item.isRecent) {
+        s.recentTotal++;
+        s.recentByTrade[item.trade] = (s.recentByTrade[item.trade] || 0) + 1;
+      }
+    });
+
+    return s;
+  }, [data]);
+
+  // --- Unique Locations for Filter ---
+  const uniqueLocations = useMemo(() => {
+    const locs = new Set(data.map(d => d.location));
+    return ['All', ...Array.from(locs).sort()];
+  }, [data]);
+
+  // --- Filtering Data for Table ---
+  const filteredList = useMemo(() => {
+    let result = [];
+    switch (activeTab) {
+      case 'open':
+        result = data.filter(d => d.isOpen);
+        break;
+      case 'recent':
+        result = data.filter(d => d.isRecent);
+        break;
+      case '120':
+        result = data.filter(d => d.isOpen && d.age >= 120);
+        break;
+      case '60':
+        result = data.filter(d => d.isOpen && d.age >= 60 && d.age <= 119);
+        break;
+      case '30':
+        result = data.filter(d => d.isOpen && d.age >= 30 && d.age <= 59);
+        break;
+      default:
+        result = [];
+    }
+
+    if (locationFilter !== 'All') {
+      result = result.filter(d => d.location === locationFilter);
+    }
+
+    return result;
+  }, [data, activeTab, locationFilter]);
+
+  const getTabTitle = () => {
+    let title = '';
+    if (activeTab === 'open') title = 'All Open Work Orders';
+    if (activeTab === 'recent') title = 'Completed in Last 14 Days';
+    if (activeTab === '120') title = 'Backlog: 120+ Days Old';
+    if (activeTab === '60') title = 'Backlog: 60-119 Days Old';
+    if (activeTab === '30') title = 'Backlog: 30-59 Days Old';
+    
+    if (locationFilter !== 'All') {
+      title += ` - ${locationFilter}`;
+    }
+    return title;
+  };
+
+  const handlePrint = () => {
+    window.focus();
+    window.print();
+  };
+
+  // --- AI Handlers ---
+  const openAiModal = (row) => {
+    setSelectedRow(row);
+    setAiResponse("");
+    setAiAction(null);
+    setModalOpen(true);
+  };
+
+  const handleAiAction = async (actionType) => {
+    if (!selectedRow) return;
+    setAiLoading(true);
+    setAiAction(actionType);
+    setAiResponse("");
+
+    let prompt = "";
+    if (actionType === 'summarize') {
+      prompt = `
+        You are a facilities management assistant. 
+        Analyze this work order:
+        Request: "${selectedRow.request}"
+        Technician Notes: "${selectedRow.comments}"
+        
+        Please provide a concise, professional 1-sentence summary of the current status or the issue. 
+        If the notes are empty, simply state "No status updates available."
+      `;
+    } else if (actionType === 'email') {
+      prompt = `
+        Write a polite, professional email to the requester (${selectedRow.requester}) regarding Work Order #${selectedRow.wo}.
+        Topic: ${selectedRow.request}
+        Location: ${selectedRow.location}
+        Current Age: ${selectedRow.age} days old.
+        Technician Notes: ${selectedRow.comments}
+        
+        If the age is over 30 days, apologize for the delay.
+        Use the notes to explain the status (e.g., waiting on parts) if available.
+        Keep it concise and helpful.
+        Tone: Warmly Professional (Formal structure with brief, polite, personal elements; uses 'we' or 'I'). Reading level: 8th grade.
+      `;
+    } else if (actionType === 'checklist') {
+      prompt = `
+        Create a 5-step safety-conscious technician checklist for this maintenance task:
+        Trade: ${selectedRow.trade}
+        Task: "${selectedRow.request}"
+        Location: ${selectedRow.location}
+        
+        Ensure the first step involves safety/PPE and the last step involves cleanup/verification.
+      `;
+    }
+
+    const result = await callGemini(prompt);
+    setAiResponse(result);
+    setAiLoading(false);
+  };
+
+  const copyToClipboard = () => {
+    if (aiResponse) {
+      // Fallback for clipboard in iframe
+      const textArea = document.createElement("textarea");
+      textArea.value = aiResponse;
+      document.body.appendChild(textArea);
+      textArea.select();
+      try {
+        document.execCommand('copy');
+      } catch (err) {
+        console.error('Unable to copy', err);
+      }
+      document.body.removeChild(textArea);
+    }
+  };
+
+  if (!data.length) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center border-t-4 border-blue-600">
+          <div className="bg-blue-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
+            <Upload className="w-8 h-8 text-blue-600" />
+          </div>
+          <h1 className="text-2xl font-bold text-gray-800 mb-2">Review Work Orders</h1>
+          <p className="text-gray-600 mb-6">
+            Upload your Work Order Report (.csv) to analyze open tasks, trade breakdowns, and aging requests.
+          </p>
+          
+          {errorMsg && (
+             <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm flex items-center gap-2 text-left">
+               <AlertCircle className="w-5 h-5 flex-shrink-0" />
+               <span>{errorMsg}</span>
+             </div>
+          )}
+
+          <label className="block w-full cursor-pointer">
+            <span className="sr-only">Choose file</span>
+            <input 
+              type="file" 
+              accept=".csv"
+              onChange={handleFileUpload}
+              className="block w-full text-sm text-gray-500
+                file:mr-4 file:py-2 file:px-4
+                file:rounded-full file:border-0
+                file:text-sm file:font-semibold
+                file:bg-blue-50 file:text-blue-700
+                hover:file:bg-blue-100"
+            />
+          </label>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6 font-sans print:p-0 print:bg-white">
+      {/* Header */}
+      <div className="max-w-7xl mx-auto mb-6 flex justify-between items-center print:hidden">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Work Order Analyst</h1>
+          <p className="text-sm text-gray-500">File: {fileName}</p>
+        </div>
+        <div className="flex gap-3">
+          <button 
+            onClick={handlePrint}
+            className="text-sm px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-2 font-medium"
+          >
+            <Printer className="w-4 h-4" /> Print Report
+          </button>
+        </div>
+      </div>
+
+      {/* Print Header (Visible only when printing) */}
+      <div className="hidden print:block mb-6">
+        <h1 className="text-2xl font-bold text-gray-900">Work Order Status Report</h1>
+        <p className="text-sm text-gray-500">Generated: {new Date().toLocaleDateString()}</p>
+        <p className="text-sm text-gray-500">Source: {fileName}</p>
+      </div>
+
+      {/* Stats Grid */}
+      <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8 print:grid-cols-4 print:gap-2">
+        
+        {/* Card 1: Open WOs */}
+        <div 
+          onClick={() => setActiveTab('open')}
+          className={`bg-white p-4 rounded-lg shadow border-l-4 cursor-pointer transition-all print:shadow-none print:border ${activeTab === 'open' ? 'ring-2 ring-blue-500 border-blue-500' : 'border-blue-500 hover:shadow-md'}`}
+        >
+          <div className="flex justify-between items-start mb-2">
+            <div>
+              <p className="text-sm font-medium text-gray-500">Total Incomplete</p>
+              <div className="flex items-baseline gap-1 flex-wrap">
+                 <h2 className="text-3xl font-bold text-gray-800">{stats.openTotal}</h2>
+                 <span className="text-xs text-gray-500 whitespace-nowrap">/ {data.length} Total</span>
+              </div>
+            </div>
+            <div className="p-2 bg-blue-50 rounded-full print:hidden">
+              <AlertCircle className="w-5 h-5 text-blue-600" />
+            </div>
+          </div>
+          <div className="text-xs text-gray-500 mt-2 h-20 overflow-y-auto print:h-auto">
+            <p className="font-semibold mb-1">By Trade:</p>
+            {Object.entries(stats.openByTrade).map(([trade, count]) => (
+              <div key={trade} className="flex justify-between py-0.5 border-b border-gray-100 last:border-0">
+                <span>{trade}</span>
+                <span className="font-medium">{count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Card 2: Recent Completed */}
+        <div 
+           onClick={() => setActiveTab('recent')}
+           className={`bg-white p-4 rounded-lg shadow border-l-4 cursor-pointer transition-all print:shadow-none print:border ${activeTab === 'recent' ? 'ring-2 ring-emerald-500 border-emerald-500' : 'border-emerald-500 hover:shadow-md'}`}
+        >
+          <div className="flex justify-between items-start mb-2">
+            <div>
+              <p className="text-sm font-medium text-gray-500">Completed (14 Days)</p>
+              <h2 className="text-3xl font-bold text-gray-800">{stats.recentTotal}</h2>
+            </div>
+            <div className="p-2 bg-emerald-50 rounded-full print:hidden">
+              <CheckCircle className="w-5 h-5 text-emerald-600" />
+            </div>
+          </div>
+          <div className="text-xs text-gray-500 mt-2 h-20 overflow-y-auto print:h-auto">
+            <p className="font-semibold mb-1">By Trade:</p>
+            {Object.entries(stats.recentByTrade).map(([trade, count]) => (
+              <div key={trade} className="flex justify-between py-0.5 border-b border-gray-100 last:border-0">
+                <span>{trade}</span>
+                <span className="font-medium">{count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Card 3: Critical Aging */}
+        <div 
+           onClick={() => setActiveTab('120')}
+           className={`bg-white p-4 rounded-lg shadow border-l-4 cursor-pointer transition-all print:shadow-none print:border ${activeTab === '120' ? 'ring-2 ring-red-500 border-red-500' : 'border-red-500 hover:shadow-md'}`}
+        >
+          <div className="flex justify-between items-start mb-2">
+            <div>
+              <p className="text-sm font-medium text-gray-500">Critical Age (120+)</p>
+              <h2 className="text-3xl font-bold text-gray-800">{stats.age120}</h2>
+            </div>
+            <div className="p-2 bg-red-50 rounded-full print:hidden">
+              <Clock className="w-5 h-5 text-red-600" />
+            </div>
+          </div>
+          <p className="text-xs text-gray-500 mt-2">
+            Work orders open for more than 4 months.
+          </p>
+        </div>
+
+        {/* Card 4: Moderate Aging */}
+        <div className="flex flex-col gap-2">
+           <div 
+             onClick={() => setActiveTab('60')}
+             className={`flex-1 bg-white p-3 rounded-lg shadow border-l-4 border-orange-400 cursor-pointer flex justify-between items-center hover:shadow-md print:shadow-none print:border ${activeTab === '60' ? 'ring-2 ring-orange-400' : ''}`}
+           >
+              <div>
+                <p className="text-xs font-medium text-gray-500">60-119 Days</p>
+                <p className="text-xl font-bold text-gray-800">{stats.age60}</p>
+              </div>
+              <Clock className="w-4 h-4 text-orange-400 print:hidden" />
+           </div>
+           <div 
+             onClick={() => setActiveTab('30')}
+             className={`flex-1 bg-white p-3 rounded-lg shadow border-l-4 border-yellow-400 cursor-pointer flex justify-between items-center hover:shadow-md print:shadow-none print:border ${activeTab === '30' ? 'ring-2 ring-yellow-400' : ''}`}
+           >
+              <div>
+                <p className="text-xs font-medium text-gray-500">30-59 Days</p>
+                <p className="text-xl font-bold text-gray-800">{stats.age30}</p>
+              </div>
+              <Clock className="w-4 h-4 text-yellow-400 print:hidden" />
+           </div>
+        </div>
+      </div>
+
+      {/* Data Table */}
+      <div className="max-w-7xl mx-auto bg-white rounded-lg shadow overflow-hidden print:shadow-none print:border">
+        <div className="px-6 py-4 border-b border-gray-200 bg-gray-50 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+          <div className="flex items-center gap-4">
+            <h3 className="text-lg font-medium text-gray-900">{getTabTitle()}</h3>
+            <span className="text-sm bg-gray-200 px-3 py-1 rounded-full text-gray-700 print:hidden">Count: {filteredList.length}</span>
+          </div>
+
+          {/* Location Filter */}
+          <div className="flex items-center gap-2 print:hidden">
+             <Filter className="w-4 h-4 text-gray-500" />
+             <select 
+               value={locationFilter}
+               onChange={(e) => setLocationFilter(e.target.value)}
+               className="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border"
+             >
+               {uniqueLocations.map(loc => (
+                 <option key={loc} value={loc}>{loc}</option>
+               ))}
+             </select>
+          </div>
+        </div>
+        
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-gray-50 print:bg-gray-100">
+              <tr>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">WO #</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Requester / Location</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/3">Details</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Assignment</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200">
+              {filteredList.map((row, idx) => (
+                <tr key={`${row.wo}-${idx}`} className="hover:bg-gray-50 break-inside-avoid">
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600 print:text-black">
+                    {row.wo}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                    {row.reqDateObj ? row.reqDateObj.toLocaleDateString() : row.reqDate}
+                    {row.isOpen && (
+                      <span className={`block text-xs mt-1 ${row.age > 60 ? 'text-red-500 font-bold' : 'text-gray-400'}`}>
+                        {row.age} days old
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-6 py-4 text-sm text-gray-900">
+                    <div className="font-medium">{row.requester}</div>
+                    <div className="text-gray-500 text-xs">{row.location}</div>
+                  </td>
+                  <td className="px-6 py-4 text-sm text-gray-500 relative group">
+                    <div className="flex justify-between items-start">
+                      <div className="mb-1 text-gray-900 font-medium">Request: {row.request}</div>
+                      
+                      {/* AI Action Button - Visible on Hover or if active */}
+                      <button 
+                        onClick={() => openAiModal(row)}
+                        className="print:hidden opacity-0 group-hover:opacity-100 transition-opacity bg-indigo-50 hover:bg-indigo-100 text-indigo-600 p-1.5 rounded-full flex items-center gap-1 text-xs font-bold border border-indigo-200 shadow-sm"
+                        title="AI Assistant Tools"
+                      >
+                         <Sparkles className="w-3.5 h-3.5" />
+                         AI Actions
+                      </button>
+                    </div>
+
+                    {row.comments && (
+                      <div className="text-xs bg-yellow-50 p-2 rounded border border-yellow-100 mt-1 print:bg-white print:border-gray-200">
+                        <span className="font-bold text-yellow-700 print:text-black">Notes: </span> 
+                        {row.comments}
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                    <div className="font-medium text-gray-900">{row.tech}</div>
+                    <div className="text-xs text-gray-500">{row.trade}</div>
+                  </td>
+                </tr>
+              ))}
+              {filteredList.length === 0 && (
+                <tr>
+                  <td colSpan="5" className="px-6 py-12 text-center text-gray-500">
+                    No work orders found in this category.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* AI Modal */}
+      {modalOpen && selectedRow && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 print:hidden">
+           <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl overflow-hidden">
+              <div className="bg-indigo-600 px-6 py-4 flex justify-between items-center text-white">
+                 <div className="flex items-center gap-2">
+                   <Sparkles className="w-5 h-5 text-indigo-200" />
+                   <h3 className="text-lg font-semibold">AI Assistant: WO #{selectedRow.wo}</h3>
+                 </div>
+                 <button onClick={() => setModalOpen(false)} className="hover:bg-indigo-700 p-1 rounded">
+                   <X className="w-5 h-5" />
+                 </button>
+              </div>
+
+              <div className="p-6">
+                {!aiResponse && !aiLoading && (
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <button 
+                      onClick={() => handleAiAction('summarize')}
+                      className="flex flex-col items-center justify-center p-6 border-2 border-gray-100 hover:border-indigo-500 hover:bg-indigo-50 rounded-lg transition-all group"
+                    >
+                      <div className="bg-indigo-100 p-3 rounded-full mb-3 group-hover:bg-indigo-200">
+                        <MessageSquare className="w-6 h-6 text-indigo-700" />
+                      </div>
+                      <h4 className="font-semibold text-gray-800">Summarize Status</h4>
+                      <p className="text-xs text-center text-gray-500 mt-1">Condensed status for reports</p>
+                    </button>
+
+                    <button 
+                      onClick={() => handleAiAction('email')}
+                      className="flex flex-col items-center justify-center p-6 border-2 border-gray-100 hover:border-blue-500 hover:bg-blue-50 rounded-lg transition-all group"
+                    >
+                      <div className="bg-blue-100 p-3 rounded-full mb-3 group-hover:bg-blue-200">
+                         <Mail className="w-6 h-6 text-blue-700" />
+                      </div>
+                      <h4 className="font-semibold text-gray-800">Draft Email</h4>
+                      <p className="text-xs text-center text-gray-500 mt-1">Update to {selectedRow.requester}</p>
+                    </button>
+
+                    <button 
+                       onClick={() => handleAiAction('checklist')}
+                       className="flex flex-col items-center justify-center p-6 border-2 border-gray-100 hover:border-emerald-500 hover:bg-emerald-50 rounded-lg transition-all group"
+                    >
+                      <div className="bg-emerald-100 p-3 rounded-full mb-3 group-hover:bg-emerald-200">
+                         <ListChecks className="w-6 h-6 text-emerald-700" />
+                      </div>
+                      <h4 className="font-semibold text-gray-800">Suggest Fix</h4>
+                      <p className="text-xs text-center text-gray-500 mt-1">Technician action plan</p>
+                    </button>
+                  </div>
+                )}
+
+                {aiLoading && (
+                  <div className="flex flex-col items-center justify-center py-12">
+                    <Loader className="w-10 h-10 text-indigo-600 animate-spin mb-4" />
+                    <p className="text-gray-500 font-medium">Generating content with Gemini...</p>
+                  </div>
+                )}
+
+                {aiResponse && (
+                  <div className="animate-in fade-in zoom-in duration-200">
+                    <div className="flex justify-between items-center mb-2">
+                       <h4 className="text-sm font-bold text-gray-500 uppercase tracking-wide">
+                         {aiAction === 'email' ? 'Draft Email' : aiAction === 'checklist' ? 'Technician Checklist' : 'Summary'}
+                       </h4>
+                       <button onClick={copyToClipboard} className="text-xs flex items-center gap-1 text-indigo-600 hover:text-indigo-800 font-medium">
+                         <Copy className="w-3 h-3" /> Copy Text
+                       </button>
+                    </div>
+                    <div className="bg-gray-50 p-4 rounded-lg border border-gray-200 whitespace-pre-wrap font-mono text-sm text-gray-800 max-h-60 overflow-y-auto">
+                      {aiResponse}
+                    </div>
+                    <button 
+                      onClick={() => { setAiResponse(""); setAiAction(null); }}
+                      className="mt-4 text-sm text-gray-500 hover:text-gray-800 underline"
+                    >
+                      Back to options
+                    </button>
+                  </div>
+                )}
+              </div>
+           </div>
+        </div>
+      )}
+    </div>
+  );
+}
